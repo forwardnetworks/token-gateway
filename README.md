@@ -87,6 +87,14 @@ PORT=8443 ./token-gateway
 
 ---
 
+## Disclaimer
+
+This project is provided as-is, without warranty of any kind. It is not an officially supported product and is intended for use by Forward Networks customers and technical teams who need lightweight OAuth2-to-Basic Auth translation for custom data integrations.
+
+Use at your own risk. Contributions and feedback are welcome.
+
+---
+
 ## License
 
 MIT License
