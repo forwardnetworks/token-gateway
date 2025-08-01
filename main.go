@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -16,9 +17,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	sts "github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 var (
@@ -29,7 +38,7 @@ var (
 	insecureTLS   = os.Getenv("ALLOW_INSECURE_TLS") == "1"
 
 	httpClient = &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns:       100,
 			IdleConnTimeout:    90 * time.Second,
@@ -81,20 +90,29 @@ func main() {
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-
-	// Dynamically reconstruct target URL from incoming request
-	upstreamHost := r.Header.Get("X-Upstream-Host")
-	if upstreamHost == "" {
-		log.Printf("[ERROR] Missing X-Upstream-Host header")
-		http.Error(w, "Missing X-Upstream-Host header", http.StatusBadRequest)
-		return
-	}
-	targetURL := fmt.Sprintf("%s%s", upstreamHost, r.URL.RequestURI())
-
 	if debugMode {
 		log.Printf("[DEBUG] Incoming request: %s %s", r.Method, r.URL.String())
 	}
 
+	// AWS routing: parse /aws/service/ActionName or /service/ActionName
+	awsPrefix := "/aws/"
+	awsPath := r.URL.Path
+	if strings.HasPrefix(awsPath, awsPrefix) {
+		awsPath = strings.TrimPrefix(awsPath, awsPrefix)
+	}
+	awsPathParts := strings.Split(strings.TrimPrefix(awsPath, "/"), "/")
+	if len(awsPathParts) == 2 && awsPathParts[0] != "" && awsPathParts[1] != "" {
+		// If path is /aws/service/Action or /service/Action, handle AWS SDK dynamic dispatch
+		handleAWSRequestWithSDK(w, r, awsPathParts[0], awsPathParts[1])
+		return
+	}
+	// If path starts with /aws/, but not /aws/service/Action, return error
+	if strings.HasPrefix(r.URL.Path, "/aws/") {
+		http.Error(w, "Invalid AWS SDK path. Use /aws/{service}/{Action}", http.StatusBadRequest)
+		return
+	}
+
+	// Non-AWS: legacy token proxy (unchanged, except X-Upstream-Host removed)
 	tokenURL := r.Header.Get("X-Token-URL")
 	if tokenURL == "" {
 		log.Printf("[ERROR] Missing X-Token-URL header")
@@ -105,44 +123,48 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if tokenField == "" {
 		tokenField = "access_token"
 	}
-
 	headerPrefix := r.Header.Get("X-Header-Prefix")
 	if headerPrefix == "" {
 		headerPrefix = "Bearer "
 	}
-
 	cacheSecs := 1800 // fallback only
-
-	clientID, clientSecret, ok := r.BasicAuth()
+	username, password, ok := r.BasicAuth()
 	if !ok {
 		log.Printf("[WARN] Missing or invalid basic auth")
 		w.Header().Set("WWW-Authenticate", `Basic realm="OAuth2 Proxy"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	log.Printf("[INFO] Authenticated client: %s", maskString(clientID))
-
-	token, err := getTokenForRoute(path, clientID, clientSecret, tokenURL, tokenField, cacheSecs)
+	var accessKeyID, secretOrToken string
+	if username != "" {
+		accessKeyID = username
+		secretOrToken = password
+	} else {
+		accessKeyID = "apikey"
+		secretOrToken = password
+	}
+	log.Printf("[INFO] Authenticated client: %s", maskString(accessKeyID))
+	token, err := getTokenForRoute(path, accessKeyID, secretOrToken, tokenURL, tokenField, cacheSecs)
 	if err != nil {
 		log.Printf("[ERROR] Token retrieval failed: %v", err)
 		http.Error(w, "Failed to retrieve token", http.StatusBadGateway)
 		return
 	}
 
+	// Legacy: try to reconstruct upstream URL from header, fallback error
+	targetURL := r.Header.Get("X-Upstream-URL")
 	if targetURL == "" {
 		log.Printf("[ERROR] Missing X-Upstream-URL header")
 		http.Error(w, "Missing X-Upstream-URL header", http.StatusBadRequest)
 		return
 	}
 	log.Printf("[INFO] Target URL: %s", targetURL)
-
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		log.Printf("[ERROR] Failed to build upstream request: %v", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-
 	for name, values := range r.Header {
 		if strings.ToLower(name) == "authorization" {
 			continue
@@ -155,30 +177,34 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req.Header.Set("Authorization", headerPrefix+token)
-
+	start := time.Now()
 	resp, err := httpClient.Do(req)
+	duration := time.Since(start)
+	log.Printf("[DEBUG] Upstream request duration: %v", duration)
+	if err != nil || (resp != nil && resp.StatusCode == http.StatusGatewayTimeout) {
+		log.Println("[WARN] First attempt failed (timeout or 504), retrying once...")
+		startRetry := time.Now()
+		resp, err = httpClient.Do(req)
+		retryDuration := time.Since(startRetry)
+		log.Printf("[DEBUG] Retry upstream request duration: %v", retryDuration)
+	}
 	if err != nil {
 		log.Printf("[ERROR] Upstream request failed: %v", err)
 		http.Error(w, "Upstream API error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-
 	log.Printf("[INFO] Upstream response: %s (%d)", targetURL, resp.StatusCode)
-
 	wHeader := w.Header()
 	for k, v := range resp.Header {
 		if strings.ToLower(k) == "content-encoding" && strings.Contains(strings.Join(v, ","), "gzip") {
-			// Strip gzip encoding before sending to client
 			continue
 		}
 		for _, val := range v {
 			wHeader.Add(k, val)
 		}
 	}
-
 	w.WriteHeader(resp.StatusCode)
-
 	var reader io.ReadCloser
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		gzipReader, err := gzip.NewReader(resp.Body)
@@ -192,7 +218,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		reader = resp.Body
 	}
-
 	if _, err := io.Copy(w, reader); err != nil {
 		log.Printf("[ERROR] Failed to copy response body: %v", err)
 	}
@@ -339,4 +364,214 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// --- AWS SDK Generic Handler ---
+
+func handleAWSRequestWithSDK(w http.ResponseWriter, r *http.Request, service string, action string) {
+	ctx := context.Background()
+	region := getRegionFromRequest(r)
+	useProfile := shouldUseProfile(r)
+	awsCreds, err := getAWSCredentialsFromRequest(r, useProfile)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	// Handle optional role assumption
+	roleToAssume := r.Header.Get("X-AWS-Role-To-Assume")
+	if roleToAssume != "" {
+		creds := credentials.NewStaticCredentialsProvider(awsCreds.AccessKeyID, awsCreds.SecretAccessKey, awsCreds.SessionToken)
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithCredentialsProvider(creds))
+		if err != nil {
+			log.Printf("[ERROR] Failed to load config for role assumption: %v", err)
+			http.Error(w, "Failed to assume role", http.StatusInternalServerError)
+			return
+		}
+		stsClient := sts.NewFromConfig(cfg)
+		input := &sts.AssumeRoleInput{
+			RoleArn:         &roleToAssume,
+			RoleSessionName: aws.String("token-gateway-session"),
+			DurationSeconds: aws.Int32(3600),
+		}
+		output, err := stsClient.AssumeRole(ctx, input)
+		if err != nil {
+			log.Printf("[ERROR] Failed to assume role: %v", err)
+			http.Error(w, "Failed to assume role", http.StatusInternalServerError)
+			return
+		}
+		credsOut := output.Credentials
+		awsCreds = aws.Credentials{
+			AccessKeyID:     *credsOut.AccessKeyId,
+			SecretAccessKey: *credsOut.SecretAccessKey,
+			SessionToken:    *credsOut.SessionToken,
+			Source:          "AssumeRole",
+			Expires:         *credsOut.Expiration,
+		}
+		log.Printf("[INFO] Assumed role %s successfully", roleToAssume)
+	}
+
+	credsProvider := credentials.NewStaticCredentialsProvider(
+		awsCreds.AccessKeyID,
+		awsCreds.SecretAccessKey,
+		awsCreds.SessionToken,
+	)
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credsProvider),
+	)
+	if err != nil {
+		log.Printf("[ERROR] Failed to create AWS SDK config: %v", err)
+		http.Error(w, "AWS SDK config error", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := buildAWSServiceClient(service, cfg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Unsupported AWS service: %s", service), http.StatusNotImplemented)
+		return
+	}
+
+	// Parse input parameters from POST body as JSON
+	var params map[string]interface{}
+	if r.Method == "POST" {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&params); err != nil && err != io.EOF {
+			http.Error(w, "Invalid JSON parameters", http.StatusBadRequest)
+			return
+		}
+	} else {
+		params = make(map[string]interface{})
+	}
+
+	result, err := invokeAWSAction(ctx, client, action, params)
+	if err != nil {
+		log.Printf("[ERROR] AWS SDK call failed: %v", err)
+		http.Error(w, fmt.Sprintf("AWS SDK call failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(result); err != nil {
+		log.Printf("[ERROR] Failed to write AWS JSON response body: %v", err)
+	}
+}
+
+func getRegionFromRequest(r *http.Request) string {
+	if reg := r.Header.Get("X-AWS-Region"); reg != "" {
+		return reg
+	}
+	if reg := r.URL.Query().Get("Region"); reg != "" {
+		return reg
+	}
+	return "us-east-1"
+}
+
+func shouldUseProfile(r *http.Request) bool {
+	// Prefer X-Token-UseProfile header, fallback to X-AWS-Use-Instance-Profile
+	return r.Header.Get("X-Token-UseProfile") == "1" || r.Header.Get("X-AWS-Use-Instance-Profile") == "1"
+}
+
+func getAWSCredentialsFromRequest(r *http.Request, useProfile bool) (aws.Credentials, error) {
+	if useProfile {
+		cfg, err := config.LoadDefaultConfig(context.Background())
+		if err != nil {
+			return aws.Credentials{}, fmt.Errorf("Failed to load instance profile credentials: %v", err)
+		}
+		creds, err := cfg.Credentials.Retrieve(context.Background())
+		if err != nil {
+			return aws.Credentials{}, fmt.Errorf("Failed to retrieve AWS credentials: %v", err)
+		}
+		return creds, nil
+	}
+	// Use BasicAuth or Authorization header
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return aws.Credentials{}, fmt.Errorf("Missing or invalid basic auth")
+	}
+	var accessKeyID, secretOrToken string
+	if username != "" {
+		accessKeyID = username
+		secretOrToken = password
+	} else {
+		accessKeyID = "apikey"
+		secretOrToken = password
+	}
+	log.Printf("[INFO] Authenticated client: %s", maskString(accessKeyID))
+	return aws.Credentials{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretOrToken,
+	}, nil
+}
+
+func buildAWSServiceClient(service string, cfg aws.Config) (interface{}, error) {
+	switch strings.ToLower(service) {
+	case "ec2":
+		return ec2.NewFromConfig(cfg), nil
+	case "s3":
+		return s3.NewFromConfig(cfg), nil
+	case "sts":
+		return sts.NewFromConfig(cfg), nil
+	default:
+		return nil, fmt.Errorf("unsupported AWS service: %s", service)
+	}
+}
+
+func invokeAWSAction(ctx context.Context, client interface{}, action string, params map[string]interface{}) ([]byte, error) {
+	clientVal := reflect.ValueOf(client)
+	method := clientVal.MethodByName(action)
+	if !method.IsValid() {
+		// Try upper-case first letter
+		actionTitle := strings.Title(action)
+		method = clientVal.MethodByName(actionTitle)
+	}
+	if !method.IsValid() {
+		// Try capitalize first letter, rest as-is
+		if len(action) > 0 {
+			actionCap := strings.ToUpper(string(action[0])) + action[1:]
+			method = clientVal.MethodByName(actionCap)
+		}
+	}
+	if !method.IsValid() {
+		return nil, fmt.Errorf("unsupported action for service: %s", action)
+	}
+	// Build the input struct for the action
+	methodType := method.Type()
+	var in []reflect.Value
+	// Most AWS SDK v2 methods have signature (context.Context, *InputType, ...opts) (OutputType, error)
+	if methodType.NumIn() >= 2 {
+		// First arg: context.Context
+		in = append(in, reflect.ValueOf(ctx))
+		// Second arg: pointer to input struct
+		inputType := methodType.In(1)
+		inputPtr := reflect.New(inputType.Elem())
+		// Populate fields from params map
+		if len(params) > 0 {
+			inputJSON, err := json.Marshal(params)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to marshal params: %v", err)
+			}
+			if err := json.Unmarshal(inputJSON, inputPtr.Interface()); err != nil {
+				return nil, fmt.Errorf("Failed to decode params into input struct: %v", err)
+			}
+		}
+		in = append(in, inputPtr)
+		// Add any extra options as zero values (not supported for now)
+	}
+	// Call the method
+	results := method.Call(in)
+	if len(results) != 2 {
+		return nil, fmt.Errorf("unexpected number of results from SDK method")
+	}
+	out := results[0].Interface()
+	errVal := results[1]
+	if !errVal.IsNil() {
+		return nil, errVal.Interface().(error)
+	}
+	// Marshal output to JSON
+	outJSON, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("Failed to marshal SDK output: %v", err)
+	}
+	return outJSON, nil
 }
