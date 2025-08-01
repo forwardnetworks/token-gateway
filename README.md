@@ -9,7 +9,6 @@ A lightweight OAuth2-aware reverse proxy for forwarding HTTP GET requests to ups
 - 🔐 OAuth2 `client_credentials` token flow
 - ☁️ Multi-cloud support for AWS and Azure
 - 🔄 SDK-backed request translation (e.g. DescribeInstances)
-- 📦 Converts AWS XML responses to JSON
 - 🧠 In-memory token caching per (client_id + token URL)
 - 🔄 Transparent forwarding of authorized GET requests
 - 🗜️ Handles gzip-compressed upstream responses
