@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -16,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -89,7 +91,6 @@ func main() {
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
 	if debugMode {
 		log.Printf("[DEBUG] Incoming request: %s %s", r.Method, r.URL.String())
 	}
@@ -112,13 +113,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-AWS: legacy token proxy (unchanged, except X-Upstream-Host removed)
 	tokenURL := r.Header.Get("X-Token-URL")
-	if tokenURL == "" {
-		log.Printf("[ERROR] Missing X-Token-URL header")
-		http.Error(w, "Missing X-Token-URL header", http.StatusBadRequest)
+	if tokenURL != "" {
+		proxyOAuth2Request(w, r, tokenURL)
 		return
 	}
+
+	proxyPassThroughRequest(w, r)
+}
+
+func proxyOAuth2Request(w http.ResponseWriter, r *http.Request, tokenURL string) {
 	tokenField := r.Header.Get("X-Token-Field")
 	if tokenField == "" {
 		tokenField = "access_token"
@@ -144,39 +148,126 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		secretOrToken = password
 	}
 	log.Printf("[INFO] Authenticated client: %s", maskString(accessKeyID))
-	token, err := getTokenForRoute(path, accessKeyID, secretOrToken, tokenURL, tokenField, cacheSecs)
+	token, err := getTokenForRoute(r.URL.Path, accessKeyID, secretOrToken, tokenURL, tokenField, cacheSecs)
 	if err != nil {
 		log.Printf("[ERROR] Token retrieval failed: %v", err)
 		http.Error(w, "Failed to retrieve token", http.StatusBadGateway)
 		return
 	}
 
-	// Legacy: try to reconstruct upstream URL from header, fallback error
-	targetURL := r.Header.Get("X-Upstream-URL")
-	if targetURL == "" {
-		log.Printf("[ERROR] Missing X-Upstream-URL header")
-		http.Error(w, "Missing X-Upstream-URL header", http.StatusBadRequest)
+	targetURL, err := resolveUpstreamURL(r)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Printf("[INFO] Target URL: %s", targetURL)
-	req, err := http.NewRequest("GET", targetURL, nil)
+	req, err := newUpstreamRequest(r, targetURL)
 	if err != nil {
 		log.Printf("[ERROR] Failed to build upstream request: %v", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	for name, values := range r.Header {
-		if strings.ToLower(name) == "authorization" {
+	copyHeaders(req.Header, r.Header, true)
+	req.Header.Set("Authorization", headerPrefix+token)
+	applyUpstreamOverrides(req, r)
+	doUpstreamRequest(w, req, targetURL)
+}
+
+func proxyPassThroughRequest(w http.ResponseWriter, r *http.Request) {
+	targetURL, err := resolveUpstreamURL(r)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req, err := newUpstreamRequest(r, targetURL)
+	if err != nil {
+		log.Printf("[ERROR] Failed to build upstream request: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	copyHeaders(req.Header, r.Header, false)
+	applyUpstreamOverrides(req, r)
+	doUpstreamRequest(w, req, targetURL)
+}
+
+func resolveUpstreamURL(r *http.Request) (string, error) {
+	if targetURL := r.Header.Get("X-Upstream-URL"); targetURL != "" {
+		return targetURL, nil
+	}
+	baseURL := r.Header.Get("X-Upstream-Base-URL")
+	if baseURL == "" {
+		return "", fmt.Errorf("Missing X-Upstream-URL or X-Upstream-Base-URL header")
+	}
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("Invalid X-Upstream-Base-URL: %w", err)
+	}
+	parsedBase.Path = strings.TrimRight(parsedBase.Path, "/") + r.URL.Path
+	parsedBase.RawQuery = r.URL.RawQuery
+	return parsedBase.String(), nil
+}
+
+func newUpstreamRequest(r *http.Request, targetURL string) (*http.Request, error) {
+	method := r.Method
+	if override := strings.TrimSpace(r.Header.Get("X-Upstream-Method")); override != "" {
+		method = strings.ToUpper(override)
+	}
+	bodyBytes, err := readUpstreamBody(r)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(method, targetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Host = req.URL.Host
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	}
+	return req, nil
+}
+
+func readUpstreamBody(r *http.Request) ([]byte, error) {
+	if override := r.Header.Get("X-Upstream-Body"); override != "" {
+		return []byte(override), nil
+	}
+	if r.Body == nil {
+		return nil, nil
+	}
+	return io.ReadAll(r.Body)
+}
+
+func applyUpstreamOverrides(req *http.Request, src *http.Request) {
+	if contentType := strings.TrimSpace(src.Header.Get("X-Upstream-Content-Type")); contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if accept := strings.TrimSpace(src.Header.Get("X-Upstream-Accept")); accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	if auth := strings.TrimSpace(src.Header.Get("X-Upstream-Authorization")); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+}
+
+func copyHeaders(dst http.Header, src http.Header, overrideAuthorization bool) {
+	for name, values := range src {
+		lower := strings.ToLower(name)
+		if lower == "host" || lower == "content-length" || lower == "connection" ||
+			lower == "keep-alive" || lower == "proxy-authenticate" || lower == "proxy-authorization" ||
+			lower == "te" || lower == "trailers" || lower == "transfer-encoding" || lower == "upgrade" {
+			continue
+		}
+		if overrideAuthorization && lower == "authorization" {
 			continue
 		}
 		for _, v := range values {
-			req.Header.Add(name, v)
-			if debugMode {
-				log.Printf("[DEBUG] Forwarding header: %s: %s", name, v)
-			}
+			dst.Add(name, v)
 		}
 	}
-	req.Header.Set("Authorization", headerPrefix+token)
+}
+
+func doUpstreamRequest(w http.ResponseWriter, req *http.Request, targetURL string) {
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	duration := time.Since(start)

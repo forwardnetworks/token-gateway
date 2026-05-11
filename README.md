@@ -1,16 +1,17 @@
-# Token Gateway Proxy
+# Connector Gateway Proxy
 
-A lightweight OAuth2-aware reverse proxy for forwarding HTTP GET requests to upstream APIs that require bearer token authentication via the `client_credentials` flow. Now with multi-cloud support for AWS and Azure, enabling seamless integration with cloud provider APIs alongside Forward Networks and other systems requiring secure, token-based access.
+A lightweight connector proxy for forwarding requests to upstream APIs. It supports OAuth2 `client_credentials` token exchange, basic-auth pass-through reverse proxying, and multi-cloud support for AWS and Azure.
 
 ---
 
 ## Features
 
 - 🔐 OAuth2 `client_credentials` token flow
+- 🔁 Basic-auth pass-through reverse proxy mode
 - ☁️ Multi-cloud support for AWS and Azure
 - 🔄 SDK-backed request translation (e.g. DescribeInstances)
 - 🧠 In-memory token caching per (client_id + token URL)
-- 🔄 Transparent forwarding of authorized GET requests
+- 🔄 Transparent forwarding of upstream requests and bodies
 - 🗜️ Handles gzip-compressed upstream responses
 - 🔒 TLS support (with fallback to self-signed certificates)
 - 🔧 Configurable via HTTP headers and environment variables
@@ -24,9 +25,25 @@ A lightweight OAuth2-aware reverse proxy for forwarding HTTP GET requests to ups
 The proxy accepts requests from clients using HTTP Basic Auth credentials (`client_id:client_secret`). It:
 1. Fetches an access token from the specified `X-Token-URL`.
 2. Caches the token in memory until expiration.
-3. Forwards the request to the upstream URL specified by combining `X-Upstream-Host` with the original request path.
+3. Forwards the request to the upstream URL specified by `X-Upstream-URL` or by combining `X-Upstream-Base-URL` with the original request path.
 4. Adds `Authorization: Bearer {access_token}` to the upstream request.
 5. Returns the upstream response to the client, decoding gzip if needed.
+
+### For Generic Pass-Through
+
+When `X-Token-URL` is omitted, the proxy runs in pass-through mode. It:
+1. Uses the incoming request method and body as-is.
+2. Forwards the incoming `Authorization` header unchanged.
+3. Sends the request to `X-Upstream-URL` or combines `X-Upstream-Base-URL` with the incoming path and query string.
+4. Returns the upstream response to the client, decoding gzip if needed.
+
+Optional upstream overrides can be provided with headers:
+
+- `X-Upstream-Method`: Override the method sent upstream.
+- `X-Upstream-Body`: Override the upstream request body.
+- `X-Upstream-Content-Type`: Override the upstream `Content-Type`.
+- `X-Upstream-Accept`: Override the upstream `Accept`.
+- `X-Upstream-Authorization`: Override the upstream `Authorization`.
 
 ### For AWS
 
@@ -64,6 +81,15 @@ X-Token-URL: https://auth.example.com/oauth2/token
 X-Upstream-Host: https://api.example.com
 ```
 
+### Generic Pass-Through Example
+
+```http
+POST /api/v1/fortimanager/jsonrpc HTTP/1.1
+Host: connector-gw.local
+Authorization: Basic base64(fortimanager_user:fortimanager_password)
+X-Upstream-Base-URL: https://fortimanager.example.com
+```
+
 ### AWS Example
 
 ```http
@@ -89,7 +115,8 @@ X-Azure-Tenant: your-tenant-id
 | Header            | Description                                                                 |
 |-------------------|-----------------------------------------------------------------------------|
 | `X-Token-URL`     | OAuth2 token endpoint (e.g. `https://auth.example.com/oauth2/token`)        |
-| `X-Upstream-Host` | Full upstream base URL, including `https://` (e.g. `https://api.example.com`) |
+| `X-Upstream-URL`  | Full upstream URL for a single request                                      |
+| `X-Upstream-Base-URL` | Base upstream URL that will be combined with the incoming path and query |
 | `X-AWS-Region`    | Required for AWS SDK requests (e.g. `us-west-2`)                            |
 | `X-Azure-Tenant`  | Required for Azure SDK authentication                                       |
 
@@ -116,6 +143,14 @@ X-Azure-Tenant: your-tenant-id
 
 ---
 
+## Mode Selection
+
+- If `X-Token-URL` is present, the request runs in OAuth2 token-exchange mode.
+- If `X-Token-URL` is absent, the request runs in generic pass-through mode.
+- AWS and Azure request handling remains available through their existing request-path conventions.
+
+---
+
 ## Building & Running
 
 ```bash
@@ -136,7 +171,7 @@ PORT=8443 ./token-gateway
 
 ## Disclaimer
 
-This project is provided as-is, without warranty of any kind. It is not an officially supported product and is intended for use by Forward Networks customers and technical teams who need lightweight OAuth2-to-Basic Auth translation for custom data integrations.
+This project is provided as-is, without warranty of any kind. It is not an officially supported product and is intended for use by Forward Networks customers and technical teams who need a lightweight connector proxy for custom API integrations.
 
 Use at your own risk. Contributions and feedback are welcome.
 
