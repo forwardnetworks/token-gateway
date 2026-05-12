@@ -123,7 +123,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokenURL := r.Header.Get("X-Token-URL")
+	tokenURL := firstNonEmpty(r.Header.Get("X-Token-URL"), os.Getenv("TOKEN_URL"))
 	if tokenURL != "" {
 		proxyOAuth2Request(w, r, tokenURL)
 		return
@@ -139,15 +139,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func proxyOAuth2Request(w http.ResponseWriter, r *http.Request, tokenURL string) {
-	tokenField := r.Header.Get("X-Token-Field")
-	if tokenField == "" {
-		tokenField = "access_token"
-	}
-	headerPrefix := r.Header.Get("X-Header-Prefix")
-	if headerPrefix == "" {
-		headerPrefix = "Bearer "
-	}
-	cacheSecs := 1800 // fallback only
+	tokenField := firstNonEmpty(r.Header.Get("X-Token-Field"), os.Getenv("TOKEN_FIELD"), "access_token")
+	headerPrefix := firstNonEmpty(r.Header.Get("X-Header-Prefix"), os.Getenv("TOKEN_HEADER_PREFIX"), "Bearer ")
+	cacheSecs := headerOrEnvInt(r, "X-Token-Cache-Seconds", "TOKEN_CACHE_SECONDS", 1800)
 	username, password, ok := r.BasicAuth()
 	if !ok {
 		log.Printf("[WARN] Missing or invalid basic auth")
@@ -247,7 +241,7 @@ func resolveUpstreamURL(r *http.Request) (string, error) {
 	}
 	baseURL := firstNonEmpty(r.Header.Get("X-Upstream-Base-URL"), os.Getenv("UPSTREAM_BASE_URL"))
 	if baseURL == "" {
-		return "", fmt.Errorf("Missing X-Upstream-URL or X-Upstream-Base-URL header")
+		return "", fmt.Errorf("missing upstream URL; set UPSTREAM_URL, UPSTREAM_BASE_URL, X-Upstream-URL, or X-Upstream-Base-URL")
 	}
 	parsedBase, err := url.Parse(baseURL)
 	if err != nil {
@@ -260,7 +254,7 @@ func resolveUpstreamURL(r *http.Request) (string, error) {
 
 func newUpstreamRequest(r *http.Request, targetURL string) (*http.Request, error) {
 	method := r.Method
-	if override := strings.TrimSpace(r.Header.Get("X-Upstream-Method")); override != "" {
+	if override := firstNonEmpty(r.Header.Get("X-Upstream-Method"), os.Getenv("UPSTREAM_METHOD")); override != "" {
 		method = strings.ToUpper(override)
 	}
 	bodyBytes, err := readUpstreamBody(r)
@@ -279,7 +273,7 @@ func newUpstreamRequest(r *http.Request, targetURL string) (*http.Request, error
 }
 
 func readUpstreamBody(r *http.Request) ([]byte, error) {
-	if override := r.Header.Get("X-Upstream-Body"); override != "" {
+	if override := firstNonEmpty(r.Header.Get("X-Upstream-Body"), os.Getenv("UPSTREAM_BODY")); override != "" {
 		return []byte(override), nil
 	}
 	if r.Body == nil {
@@ -289,13 +283,13 @@ func readUpstreamBody(r *http.Request) ([]byte, error) {
 }
 
 func applyUpstreamOverrides(req *http.Request, src *http.Request) {
-	if contentType := strings.TrimSpace(src.Header.Get("X-Upstream-Content-Type")); contentType != "" {
+	if contentType := firstNonEmpty(src.Header.Get("X-Upstream-Content-Type"), os.Getenv("UPSTREAM_CONTENT_TYPE")); contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	if accept := strings.TrimSpace(src.Header.Get("X-Upstream-Accept")); accept != "" {
+	if accept := firstNonEmpty(src.Header.Get("X-Upstream-Accept"), os.Getenv("UPSTREAM_ACCEPT")); accept != "" {
 		req.Header.Set("Accept", accept)
 	}
-	if auth := strings.TrimSpace(src.Header.Get("X-Upstream-Authorization")); auth != "" {
+	if auth := firstNonEmpty(src.Header.Get("X-Upstream-Authorization"), os.Getenv("UPSTREAM_AUTHORIZATION")); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 }
@@ -333,7 +327,7 @@ func getSessionForRoute(r *http.Request, username, password string, forceRefresh
 		return CachedSession{}, err
 	}
 	cacheKey := fmt.Sprintf("%s|%s", loginURL, username)
-	cacheSecs := headerInt(r, "X-Session-Cache-Seconds", 1800)
+	cacheSecs := headerOrEnvInt(r, "X-Session-Cache-Seconds", "SESSION_CACHE_SECONDS", 1800)
 
 	cacheLock.Lock()
 	if cached, found := sessionCache[cacheKey]; found && !forceRefresh && time.Now().Before(cached.Expiry) {
@@ -588,16 +582,20 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func headerInt(r *http.Request, name string, fallback int) int {
-	value := strings.TrimSpace(r.Header.Get(name))
-	if value == "" {
-		return fallback
+func headerOrEnvInt(r *http.Request, headerName, envName string, fallback int) int {
+	if value := strings.TrimSpace(r.Header.Get(headerName)); value != "" {
+		var parsed int
+		if _, err := fmt.Sscanf(value, "%d", &parsed); err == nil && parsed > 0 {
+			return parsed
+		}
 	}
-	var parsed int
-	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
-		return fallback
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		var parsed int
+		if _, err := fmt.Sscanf(value, "%d", &parsed); err == nil && parsed > 0 {
+			return parsed
+		}
 	}
-	return parsed
+	return fallback
 }
 
 func originFromURL(rawURL string) string {

@@ -1,221 +1,170 @@
 # Connector Gateway Proxy
 
-A lightweight connector proxy for forwarding requests to upstream APIs. It supports OAuth2 `client_credentials` token exchange, session-cookie authentication, basic-auth pass-through reverse proxying, and multi-cloud support for AWS and Azure.
+A lightweight proxy for forwarding client requests to upstream APIs that need a different authentication or request format than the client can natively provide.
+
+The common deployment pattern is:
+
+1. The client sends a normal request to the gateway, usually with Basic Auth.
+2. The gateway applies authentication or request translation.
+3. The gateway forwards the request path, query string, method, body, and allowed headers to the configured upstream API.
+4. The gateway returns the upstream response.
+
+For clients that cannot send custom control headers, configure the gateway with environment variables.
 
 ---
 
 ## Features
 
-- 🔐 OAuth2 `client_credentials` token flow
-- 🍪 Session-cookie login flow for APIs that cannot accept Basic auth per request
-- 🔁 Basic-auth pass-through reverse proxy mode
-- ☁️ Multi-cloud support for AWS and Azure
-- 🔄 SDK-backed request translation (e.g. DescribeInstances)
-- 🧠 In-memory token caching per (client_id + token URL)
-- 🔄 Transparent forwarding of upstream requests and bodies
-- 🗜️ Handles gzip-compressed upstream responses
-- 🔒 TLS support (with fallback to self-signed certificates)
-- 🔧 Configurable via HTTP headers and environment variables
+- OAuth2 `client_credentials` token exchange
+- Session-cookie login for upstream APIs that cannot accept Basic Auth per request
+- Basic-auth pass-through reverse proxy mode
+- AWS and Azure request translation paths
+- In-memory token and session caching
+- Transparent forwarding of upstream request paths, query strings, methods, bodies, and responses
+- Gzip response handling
+- TLS support, with optional self-signed certificate fallback
+- Configuration through environment variables, with optional header overrides for flexible clients
 
 ---
 
-## How It Works
+## Modes
 
-### For OAuth2 (Generic)
+### OAuth2 Token Exchange
 
-The proxy accepts requests from clients using HTTP Basic Auth credentials (`client_id:client_secret`). It:
-1. Fetches an access token from the specified `X-Token-URL`.
-2. Caches the token in memory until expiration.
-3. Forwards the request to the upstream URL specified by `X-Upstream-URL` or by combining `X-Upstream-Base-URL` with the original request path.
-4. Adds `Authorization: Bearer {access_token}` to the upstream request.
-5. Returns the upstream response to the client, decoding gzip if needed.
+The gateway accepts Basic Auth credentials from the client, uses them as `client_id:client_secret`, retrieves an OAuth2 token, and forwards the upstream request with `Authorization: Bearer <token>`.
 
-### For Generic Pass-Through
+Enable this mode with `TOKEN_URL` or `X-Token-URL`.
 
-When `X-Token-URL` is omitted, the proxy runs in pass-through mode. It:
-1. Uses the incoming request method and body as-is.
-2. Forwards the incoming `Authorization` header unchanged.
-3. Sends the request to `X-Upstream-URL` or combines `X-Upstream-Base-URL` with the incoming path and query string.
-4. Returns the upstream response to the client, decoding gzip if needed.
+### Session-Cookie Login
 
-Optional upstream overrides can be provided with headers:
+The gateway accepts Basic Auth credentials from the client, posts them to an upstream login endpoint, caches the returned cookies, and forwards upstream requests with the session cookies instead of the client Basic Auth header.
 
-- `X-Upstream-Method`: Override the method sent upstream.
-- `X-Upstream-Body`: Override the upstream request body.
-- `X-Upstream-Content-Type`: Override the upstream `Content-Type`.
-- `X-Upstream-Accept`: Override the upstream `Accept`.
-- `X-Upstream-Authorization`: Override the upstream `Authorization`.
+Enable this mode with `PROXY_AUTH_MODE=session`, `SESSION_LOGIN_URL`, `X-Auth-Mode: session`, or `X-Session-Login-URL`.
 
-### For Generic Session-Cookie APIs
+The login request is generic:
 
-When `X-Auth-Mode: session`, `PROXY_AUTH_MODE=session`, `X-Session-Login-URL`, or `SESSION_LOGIN_URL` is set, the proxy uses the incoming Basic Auth credentials only to authenticate to the upstream login endpoint. It:
-1. Logs in to the upstream API with `username` and `password` form fields by default.
-2. Caches the returned session cookies in memory.
-3. Forwards the original request path and query string to `X-Upstream-Base-URL` or `UPSTREAM_BASE_URL`.
-4. Replaces the client Basic Auth header with the upstream session cookies.
-5. Adds the configured CSRF header and `Referer` when a CSRF token is returned.
-6. Refreshes the session and retries once on `401` or `403`.
+- Default content type: `application/x-www-form-urlencoded`
+- Default username field: `username`
+- Default password field: `password`
+- Custom login body templates can use `{{username}}` and `{{password}}`
+- CSRF cookie names and the outbound CSRF header are configurable
 
-This mode is generic. It is useful for API platforms where the client can only send Basic Auth to the proxy, but the upstream requires login-session cookies, CSRF headers, or another form-post login flow.
+### Basic Pass-Through
 
-For VMware Avi Load Balancer / NSX Advanced Load Balancer environments where Basic Authentication is disabled, the Forward AVI collector can send Basic Auth to this gateway while the gateway performs session authentication against the real controller.
+When token and session modes are not enabled, the gateway forwards the request to the configured upstream and keeps the incoming `Authorization` header unless overridden.
 
-For Avi, configure the gateway with:
+This mode has been tested with a FortiManager JSON-RPC data-connector workflow.
+
+---
+
+## Forward-Compatible Configuration
+
+Use environment variables when the client cannot send gateway control headers.
+
+### Basic Pass-Through
+
+```bash
+PORT=8443 \
+UPSTREAM_BASE_URL=https://upstream.example.com \
+./token-gateway
+```
+
+### OAuth2 Token Exchange
+
+```bash
+PORT=8443 \
+TOKEN_URL=https://auth.example.com/oauth2/token \
+UPSTREAM_BASE_URL=https://api.example.com \
+./token-gateway
+```
+
+### Session-Cookie Login
 
 ```bash
 PORT=8443 \
 PROXY_AUTH_MODE=session \
-UPSTREAM_BASE_URL=https://avi-controller.example.com \
-SESSION_LOGIN_URL=https://avi-controller.example.com/login \
-ALLOW_INSECURE_TLS=1 \
+UPSTREAM_BASE_URL=https://api.example.com \
+SESSION_LOGIN_URL=https://api.example.com/login \
 ./token-gateway
 ```
 
-Then configure Forward's Avi API source to use the gateway host as the Avi controller. Forward's requests to `/api/...`, query strings such as `page=`, and headers such as `X-Avi-Tenant` are forwarded to the real controller.
-
-### For AWS
-
-The proxy accepts Basic Auth using AWS credentials (`access_key:secret_key`) or uses an EC2 instance profile. It:
-1. Parses the request path as `/SERVICE/ACTION`, e.g. `/ec2/DescribeInstances`.
-2. Constructs the appropriate API call using the AWS SDK.
-3. Automatically converts XML responses to JSON.
-4. Supports multi-region requests.
-
-Required Header:
-- `X-AWS-Region`: Comma-separated list of AWS regions
-
-Optional Header:
-- `X-Use-Instance-Profile: 1` to use the instance metadata service
-
-### For Azure
-
-The proxy accepts Basic Auth using Azure credentials (`client_id:client_secret`) and requires a tenant header.
-1. Uses the `X-Azure-Tenant` header to authenticate.
-2. Calls Azure REST APIs using the provided client/secret.
-3. Forwards authenticated results to the client.
-
-Required Header:
-- `X-Azure-Tenant`: Azure tenant ID
-
----
-
-## Example Client Request
-
-```http
-GET /upstream/api/resource HTTP/1.1
-Host: token-gw.local
-Authorization: Basic base64(client_id:client_secret)
-X-Token-URL: https://auth.example.com/oauth2/token
-X-Upstream-Host: https://api.example.com
-```
-
-### Generic Pass-Through Example
-
-```http
-POST /api/v1/fortimanager/jsonrpc HTTP/1.1
-Host: connector-gw.local
-Authorization: Basic base64(fortimanager_user:fortimanager_password)
-X-Upstream-Base-URL: https://fortimanager.example.com
-```
-
-### Generic Session-Cookie Example
-
-```http
-GET /api/virtualservice?page=1 HTTP/1.1
-Host: connector-gw.local
-Authorization: Basic base64(avi_user:avi_password)
-X-Auth-Mode: session
-X-Upstream-Base-URL: https://avi-controller.example.com
-X-Session-Login-URL: https://avi-controller.example.com/login
-X-Avi-Tenant: admin
-```
-
-### AWS Example
-
-```http
-GET /ec2/DescribeInstances HTTP/1.1
-Host: token-gw.local
-Authorization: Basic base64(aws_access_key:aws_secret_key)
-X-AWS-Region: us-east-1
-```
-
-### Azure Example
-
-```http
-GET /azure/subscriptions HTTP/1.1
-Host: token-gw.local
-Authorization: Basic base64(client_id:client_secret)
-X-Azure-Tenant: your-tenant-id
-```
-
----
-
-## Required Headers
-
-| Header            | Description                                                                 |
-|-------------------|-----------------------------------------------------------------------------|
-| `X-Token-URL`     | OAuth2 token endpoint (e.g. `https://auth.example.com/oauth2/token`)        |
-| `X-Upstream-URL`  | Full upstream URL for a single request                                      |
-| `X-Upstream-Base-URL` | Base upstream URL that will be combined with the incoming path and query |
-| `X-Auth-Mode`     | Set to `session` for session-cookie mode                                    |
-| `X-Session-Login-URL` | Login endpoint for session-cookie mode                                 |
-| `X-AWS-Region`    | Required for AWS SDK requests (e.g. `us-west-2`)                            |
-| `X-Azure-Tenant`  | Required for Azure SDK authentication                                       |
-
----
-
-## Optional Headers
-
-| Header              | Description                                                 | Default        |
-|---------------------|-------------------------------------------------------------|----------------|
-| `X-Token-Field`     | JSON field in token response that contains the token        | `access_token` |
-| `X-Header-Prefix`   | Authorization header prefix                                 | `Bearer `      |
-| `X-Session-Login-Content-Type` | Content type for session login request         | `application/x-www-form-urlencoded` |
-| `X-Session-Login-Body` | Template for session login body; supports `{{username}}` and `{{password}}` | `username=...&password=...` |
-| `X-Session-Username-Field` | Username form field for default session login body   | `username` |
-| `X-Session-Password-Field` | Password form field for default session login body   | `password` |
-| `X-Session-Cache-Seconds` | Session cache lifetime in seconds                    | `1800` |
-| `X-Session-CSRF-Cookie-Names` | Comma-separated cookie names to inspect for a CSRF token | `csrftoken,csrf_token` |
-| `X-Session-CSRF-Header` | Header used to forward the CSRF token upstream        | `X-CSRFToken` |
+In all three examples, the client only needs to call the gateway URL and provide the credentials it normally supports. The gateway supplies the upstream destination and authentication behavior.
 
 ---
 
 ## Environment Variables
 
-| Variable             | Description                                                  | Default       |
-|----------------------|--------------------------------------------------------------|---------------|
-| `PORT`               | Port to listen on (required)                                 | N/A           |
-| `DEBUG`              | Enable debug logging (set to `1` to enable)                  | Disabled      |
-| `ALLOW_INSECURE_TLS` | Skip TLS verification for token and upstream calls           | Disabled      |
-| `TLS_CERT`           | Path to TLS certificate (optional)                           | Auto-generate |
-| `TLS_KEY`            | Path to TLS private key (optional)                           | Auto-generate |
-| `PROXY_AUTH_MODE`    | Set to `session` to enable session-cookie mode by default    | N/A           |
-| `UPSTREAM_URL`       | Full upstream URL fallback                                   | N/A           |
-| `UPSTREAM_BASE_URL`  | Base upstream URL fallback                                   | N/A           |
-| `SESSION_LOGIN_URL`  | Session login URL fallback                                   | N/A           |
-| `SESSION_LOGIN_CONTENT_TYPE` | Session login content type fallback                 | `application/x-www-form-urlencoded` |
-| `SESSION_LOGIN_BODY` | Session login body template fallback                         | N/A           |
-| `SESSION_USERNAME_FIELD` | Username form field fallback                             | `username`    |
-| `SESSION_PASSWORD_FIELD` | Password form field fallback                             | `password`    |
-| `SESSION_CSRF_COOKIE_NAMES` | Comma-separated cookie names to inspect for a CSRF token | `csrftoken,csrf_token` |
-| `SESSION_CSRF_HEADER` | Header used to forward the CSRF token upstream              | `X-CSRFToken` |
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PORT` | Port to listen on | Required |
+| `DEBUG` | Set to `1` for debug logging | Disabled |
+| `ALLOW_INSECURE_TLS` | Set to `1` to skip upstream TLS verification | Disabled |
+| `TLS_CERT` | TLS certificate path | Auto-generate |
+| `TLS_KEY` | TLS private key path | Auto-generate |
+| `UPSTREAM_URL` | Full upstream URL for every request | N/A |
+| `UPSTREAM_BASE_URL` | Base upstream URL combined with the incoming path and query string | N/A |
+| `UPSTREAM_METHOD` | Override upstream method | Incoming method |
+| `UPSTREAM_BODY` | Override upstream request body | Incoming body |
+| `UPSTREAM_CONTENT_TYPE` | Override upstream `Content-Type` | Incoming header |
+| `UPSTREAM_ACCEPT` | Override upstream `Accept` | Incoming header |
+| `UPSTREAM_AUTHORIZATION` | Override upstream `Authorization` | Incoming header or mode-specific auth |
+| `TOKEN_URL` | OAuth2 token endpoint | N/A |
+| `TOKEN_FIELD` | JSON field containing the token | `access_token` |
+| `TOKEN_HEADER_PREFIX` | Upstream authorization prefix | `Bearer ` |
+| `TOKEN_CACHE_SECONDS` | Fallback token cache TTL | `1800` |
+| `PROXY_AUTH_MODE` | Set to `session` for session-cookie mode | N/A |
+| `SESSION_LOGIN_URL` | Session login endpoint | Derived from `UPSTREAM_BASE_URL` + `/login` |
+| `SESSION_LOGIN_CONTENT_TYPE` | Login request content type | `application/x-www-form-urlencoded` |
+| `SESSION_LOGIN_BODY` | Login body template with `{{username}}` and `{{password}}` | Generated from username/password fields |
+| `SESSION_USERNAME_FIELD` | Username form field for generated login body | `username` |
+| `SESSION_PASSWORD_FIELD` | Password form field for generated login body | `password` |
+| `SESSION_CACHE_SECONDS` | Session cache TTL | `1800` |
+| `SESSION_CSRF_COOKIE_NAMES` | Comma-separated CSRF cookie names | `csrftoken,csrf_token` |
+| `SESSION_CSRF_HEADER` | Header used to forward CSRF token | `X-CSRFToken` |
 
 ---
 
-## Mode Selection
+## Optional Header Overrides
 
-- If `X-Token-URL` is present, the request runs in OAuth2 token-exchange mode.
-- If session mode is enabled with `X-Auth-Mode: session`, `PROXY_AUTH_MODE=session`, `X-Session-Login-URL`, or `SESSION_LOGIN_URL`, the request runs in session-cookie mode.
-- If `X-Token-URL` is absent, the request runs in generic pass-through mode.
-- AWS and Azure request handling remains available through their existing request-path conventions.
+For clients that can send custom headers, these headers override the matching environment variables:
+
+| Header | Description |
+| --- | --- |
+| `X-Upstream-URL` | Full upstream URL |
+| `X-Upstream-Base-URL` | Base upstream URL |
+| `X-Upstream-Method` | Override upstream method |
+| `X-Upstream-Body` | Override upstream body |
+| `X-Upstream-Content-Type` | Override upstream `Content-Type` |
+| `X-Upstream-Accept` | Override upstream `Accept` |
+| `X-Upstream-Authorization` | Override upstream `Authorization` |
+| `X-Token-URL` | OAuth2 token endpoint |
+| `X-Token-Field` | JSON field containing the token |
+| `X-Header-Prefix` | Upstream authorization prefix |
+| `X-Token-Cache-Seconds` | Token cache TTL |
+| `X-Auth-Mode` | Set to `session` for session-cookie mode |
+| `X-Session-Login-URL` | Session login endpoint |
+| `X-Session-Login-Content-Type` | Login request content type |
+| `X-Session-Login-Body` | Login body template |
+| `X-Session-Username-Field` | Username field for generated login body |
+| `X-Session-Password-Field` | Password field for generated login body |
+| `X-Session-Cache-Seconds` | Session cache TTL |
+| `X-Session-CSRF-Cookie-Names` | Comma-separated CSRF cookie names |
+| `X-Session-CSRF-Header` | Header used to forward CSRF token |
 
 ---
 
-## Building & Running
+## AWS and Azure
+
+AWS and Azure translation paths remain available for clients that can provide the required request shape and credentials.
+
+AWS region is read from `X-AWS-Region`. Azure tenant is read from `X-Azure-Tenant`.
+
+---
+
+## Building and Running
 
 ```bash
 go build -o token-gateway main.go
-
 PORT=8443 ./token-gateway
 ```
 
@@ -223,20 +172,19 @@ PORT=8443 ./token-gateway
 
 ## Security Notes
 
-- Tokens are cached in-memory, keyed by client credentials and token URL.
-- TLS is enforced by default. Self-signed certs are used if none are provided.
-- To connect to upstreams with self-signed certs, set `ALLOW_INSECURE_TLS=1`.
+- Tokens and sessions are cached in memory only.
+- TLS is enabled by default.
+- Self-signed certificates are generated if `TLS_CERT` and `TLS_KEY` are not provided.
+- Use `ALLOW_INSECURE_TLS=1` only for lab or controlled environments.
 
 ---
 
 ## Disclaimer
 
-This project is provided as-is, without warranty of any kind. It is not an officially supported product and is intended for use by Forward Networks customers and technical teams who need a lightweight connector proxy for custom API integrations.
+This project is provided as-is, without warranty of any kind. It is not an officially supported product and is intended for Forward Networks customers and technical teams who need a lightweight connector proxy for custom API integrations.
 
 Use at your own risk. Contributions and feedback are welcome.
 
 ---
 
 ## License
-
-MIT License
