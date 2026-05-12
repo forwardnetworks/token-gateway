@@ -57,6 +57,16 @@ type CachedToken struct {
 	Expiry time.Time
 }
 
+type CachedSession struct {
+	CookieHeader string
+	CSRFToken    string
+	CSRFHeader   string
+	Referer      string
+	Expiry       time.Time
+}
+
+var sessionCache = make(map[string]CachedSession)
+
 func main() {
 	if listenAddress == ":" {
 		log.Fatal("[FATAL] PORT environment variable not set")
@@ -116,6 +126,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	tokenURL := r.Header.Get("X-Token-URL")
 	if tokenURL != "" {
 		proxyOAuth2Request(w, r, tokenURL)
+		return
+	}
+
+	if strings.EqualFold(firstNonEmpty(r.Header.Get("X-Auth-Mode"), os.Getenv("PROXY_AUTH_MODE")), "session") ||
+		firstNonEmpty(r.Header.Get("X-Session-Login-URL"), os.Getenv("SESSION_LOGIN_URL")) != "" {
+		proxySessionRequest(w, r)
 		return
 	}
 
@@ -191,11 +207,45 @@ func proxyPassThroughRequest(w http.ResponseWriter, r *http.Request) {
 	doUpstreamRequest(w, req, targetURL)
 }
 
+func proxySessionRequest(w http.ResponseWriter, r *http.Request) {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		log.Printf("[WARN] Missing or invalid basic auth")
+		w.Header().Set("WWW-Authenticate", `Basic realm="Session Proxy"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	targetURL, err := resolveUpstreamURL(r)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp, err := doSessionRequest(r, targetURL, username, password, false)
+	if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		log.Printf("[WARN] Session rejected with %d; refreshing and retrying once", resp.StatusCode)
+		resp.Body.Close()
+		resp, err = doSessionRequest(r, targetURL, username, password, true)
+	}
+	if err != nil {
+		log.Printf("[ERROR] Session upstream request failed: %v", err)
+		http.Error(w, "Upstream API error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	writeUpstreamResponse(w, resp, targetURL)
+}
+
 func resolveUpstreamURL(r *http.Request) (string, error) {
 	if targetURL := r.Header.Get("X-Upstream-URL"); targetURL != "" {
 		return targetURL, nil
 	}
-	baseURL := r.Header.Get("X-Upstream-Base-URL")
+	if targetURL := os.Getenv("UPSTREAM_URL"); targetURL != "" {
+		return targetURL, nil
+	}
+	baseURL := firstNonEmpty(r.Header.Get("X-Upstream-Base-URL"), os.Getenv("UPSTREAM_BASE_URL"))
 	if baseURL == "" {
 		return "", fmt.Errorf("Missing X-Upstream-URL or X-Upstream-Base-URL header")
 	}
@@ -250,6 +300,130 @@ func applyUpstreamOverrides(req *http.Request, src *http.Request) {
 	}
 }
 
+func doSessionRequest(r *http.Request, targetURL, username, password string, forceRefresh bool) (*http.Response, error) {
+	session, err := getSessionForRoute(r, username, password, forceRefresh)
+	if err != nil {
+		return nil, err
+	}
+	req, err := newUpstreamRequest(r, targetURL)
+	if err != nil {
+		return nil, err
+	}
+	copyHeaders(req.Header, r.Header, true)
+	applyUpstreamOverrides(req, r)
+	req.Header.Del("Authorization")
+	if session.CookieHeader != "" {
+		req.Header.Set("Cookie", session.CookieHeader)
+	}
+	if session.CSRFToken != "" {
+		req.Header.Set(session.CSRFHeader, session.CSRFToken)
+	}
+	if session.Referer != "" {
+		req.Header.Set("Referer", session.Referer)
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+	return httpClient.Do(req)
+}
+
+func getSessionForRoute(r *http.Request, username, password string, forceRefresh bool) (CachedSession, error) {
+	loginURL, err := resolveSessionLoginURL(r)
+	if err != nil {
+		return CachedSession{}, err
+	}
+	cacheKey := fmt.Sprintf("%s|%s", loginURL, username)
+	cacheSecs := headerInt(r, "X-Session-Cache-Seconds", 1800)
+
+	cacheLock.Lock()
+	if cached, found := sessionCache[cacheKey]; found && !forceRefresh && time.Now().Before(cached.Expiry) {
+		cacheLock.Unlock()
+		return cached, nil
+	}
+	cacheLock.Unlock()
+
+	session, err := loginSession(r, loginURL, username, password, cacheSecs)
+	if err != nil {
+		return CachedSession{}, err
+	}
+
+	cacheLock.Lock()
+	sessionCache[cacheKey] = session
+	cacheLock.Unlock()
+	return session, nil
+}
+
+func resolveSessionLoginURL(r *http.Request) (string, error) {
+	if loginURL := firstNonEmpty(r.Header.Get("X-Session-Login-URL"), os.Getenv("SESSION_LOGIN_URL")); loginURL != "" {
+		return loginURL, nil
+	}
+	baseURL := firstNonEmpty(r.Header.Get("X-Upstream-Base-URL"), os.Getenv("UPSTREAM_BASE_URL"))
+	if baseURL == "" {
+		return "", fmt.Errorf("Missing X-Session-Login-URL or UPSTREAM_BASE_URL for session auth")
+	}
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("Invalid upstream base URL: %w", err)
+	}
+	parsedBase.Path = strings.TrimRight(parsedBase.Path, "/") + "/login"
+	parsedBase.RawQuery = ""
+	return parsedBase.String(), nil
+}
+
+func loginSession(r *http.Request, loginURL, username, password string, cacheSecs int) (CachedSession, error) {
+	contentType := firstNonEmpty(r.Header.Get("X-Session-Login-Content-Type"), os.Getenv("SESSION_LOGIN_CONTENT_TYPE"), "application/x-www-form-urlencoded")
+	body := firstNonEmpty(r.Header.Get("X-Session-Login-Body"), os.Getenv("SESSION_LOGIN_BODY"))
+	if body == "" {
+		values := url.Values{}
+		values.Set(firstNonEmpty(r.Header.Get("X-Session-Username-Field"), os.Getenv("SESSION_USERNAME_FIELD"), "username"), username)
+		values.Set(firstNonEmpty(r.Header.Get("X-Session-Password-Field"), os.Getenv("SESSION_PASSWORD_FIELD"), "password"), password)
+		body = values.Encode()
+	} else {
+		body = strings.ReplaceAll(body, "{{username}}", username)
+		body = strings.ReplaceAll(body, "{{password}}", password)
+	}
+
+	req, err := http.NewRequest("POST", loginURL, strings.NewReader(body))
+	if err != nil {
+		return CachedSession{}, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return CachedSession{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return CachedSession{}, fmt.Errorf("session login failed: %s", resp.Status)
+	}
+
+	var cookieParts []string
+	csrfToken := ""
+	csrfCookieNames := splitList(firstNonEmpty(r.Header.Get("X-Session-CSRF-Cookie-Names"), os.Getenv("SESSION_CSRF_COOKIE_NAMES"), "csrftoken,csrf_token"))
+	for _, cookie := range resp.Cookies() {
+		cookieParts = append(cookieParts, cookie.Name+"="+cookie.Value)
+		if containsFold(csrfCookieNames, cookie.Name) {
+			csrfToken = cookie.Value
+		}
+	}
+	csrfHeader := firstNonEmpty(r.Header.Get("X-Session-CSRF-Header"), os.Getenv("SESSION_CSRF_HEADER"), "X-CSRFToken")
+	if csrfToken == "" {
+		csrfToken = firstNonEmpty(resp.Header.Get(csrfHeader), resp.Header.Get("X-CSRF-Token"), resp.Header.Get("X-CSRFToken"))
+	}
+	if len(cookieParts) == 0 {
+		return CachedSession{}, fmt.Errorf("session login did not return cookies")
+	}
+
+	return CachedSession{
+		CookieHeader: strings.Join(cookieParts, "; "),
+		CSRFToken:    csrfToken,
+		CSRFHeader:   csrfHeader,
+		Referer:      originFromURL(loginURL),
+		Expiry:       time.Now().Add(time.Duration(cacheSecs) * time.Second),
+	}, nil
+}
+
 func copyHeaders(dst http.Header, src http.Header, overrideAuthorization bool) {
 	for name, values := range src {
 		lower := strings.ToLower(name)
@@ -285,6 +459,10 @@ func doUpstreamRequest(w http.ResponseWriter, req *http.Request, targetURL strin
 		return
 	}
 	defer resp.Body.Close()
+	writeUpstreamResponse(w, resp, targetURL)
+}
+
+func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response, targetURL string) {
 	log.Printf("[INFO] Upstream response: %s (%d)", targetURL, resp.StatusCode)
 	wHeader := w.Header()
 	for k, v := range resp.Header {
@@ -399,6 +577,55 @@ func maskString(s string) string {
 		return "***"
 	}
 	return s[:2] + "***" + s[len(s)-2:]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func headerInt(r *http.Request, name string, fallback int) int {
+	value := strings.TrimSpace(r.Header.Get(name))
+	if value == "" {
+		return fallback
+	}
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func originFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func splitList(value string) []string {
+	var result []string
+	for _, part := range strings.Split(value, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func generateSelfSignedCert(certFile, keyFile string) error {
